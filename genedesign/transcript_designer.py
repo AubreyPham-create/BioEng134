@@ -72,6 +72,7 @@ class TranscriptDesigner:
         codons.sort(key=lambda c: self.codon_weights.get(c, 0) * random.random(), reverse=True)
         return codons
 
+    # current best implementation
     def _optimize_window(self, global_history: str, local_context: str, peptide: str, strict=True) -> list[str]:
         best_codons = []
         eval_counter = [0]
@@ -101,8 +102,9 @@ class TranscriptDesigner:
                 if eval_counter[0] > max_evals: break
                 test_local_context = current_local_context + codon
                 
-                # Hard Constraints
-                passed_forbidden, _ = self.forbidden_checker.run(test_local_context[-12:])
+                # FIX 1: Pass the whole local_context (which we will expand to 50bp) 
+                # instead of slicing to [-12:] inside the loop
+                passed_forbidden, _ = self.forbidden_checker.run(test_local_context)
                 passed_homopolymer, _ = self.homopolymer_checker.run(test_local_context)
                 
                 if passed_forbidden and passed_homopolymer:
@@ -114,12 +116,11 @@ class TranscriptDesigner:
         return best_codons
 
     def run(self, peptide: str, ignores: set) -> Transcript:
-        # Fix Translation/Completeness: Ensure Start (M) and Stop (*) codons
         if not peptide.startswith('M'):
             peptide = 'M' + peptide
         full_peptide = peptide if peptide.endswith('*') else peptide + '*'
         
-        max_attempts = 15 # Slightly increased to give the strict CAI/Diversity checks more room to succeed
+        max_attempts = 15
         local_ignores = set(ignores)
         attempt_history = {}
 
@@ -129,33 +130,32 @@ class TranscriptDesigner:
                 utr = selectedRBS.utr.upper()
                 committed_codons = []
                 
-                # Step 1-by-1 through the peptide to ensure correct translation frame
                 for i in range(len(full_peptide)):
                     target_peptide = full_peptide[i : i + 3]
                     full_context = utr + ''.join(committed_codons)
                     
-                    window_codons = self._optimize_window(full_context[-60:], full_context[-12:], target_peptide, strict=True)
+                    # FIX 2: Expand structure history to 150bp, and local forbidden context to 50bp
+                    window_codons = self._optimize_window(full_context[-150:], full_context[-50:], target_peptide, strict=True)
                     
                     if not window_codons:
                         raise ValueError("Trap")
                     
                     committed_codons.append(window_codons[0])
                 
-                # GLOBAL CHECK: Validate CAI, Diversity, and Rare Codons using unmodified codon_checker
                 codons_above_board, codon_div, rare_count, cai_val = self.codon_checker.run(committed_codons)
                 if not codons_above_board:
                     raise ValueError(f"Codon metrics failed: CAI={cai_val:.2f}, Div={codon_div:.2f}")
                 
-                return Transcript(selectedRBS, peptide, committed_codons)
+                # FIX 3: Return full_peptide to satisfy the completeness checker
+                return Transcript(selectedRBS, full_peptide, committed_codons)
 
             except ValueError:
-                # If it hits a trap or fails the CAI check, record how far it got and try a new RBS
                 attempt_history[selectedRBS] = len(committed_codons)
                 local_ignores.add(selectedRBS)
             except Exception:
                 break
 
-        # Emergency Fallback (If all strict attempts fail)
+        # Emergency Fallback
         best_rbs = max(attempt_history, key=attempt_history.get) if attempt_history else self.rbsChooser.run("", ignores)
         utr = best_rbs.utr.upper()
         committed_codons = []
@@ -164,7 +164,8 @@ class TranscriptDesigner:
             target_peptide = full_peptide[i : i + 1]
             full_context = utr + ''.join(committed_codons)
             
-            window_codons = self._optimize_window(full_context[-60:], full_context[-12:], target_peptide, strict=False)
+            # Apply expanded lookbacks here as well
+            window_codons = self._optimize_window(full_context[-150:], full_context[-50:], target_peptide, strict=False)
             
             if not window_codons:
                 aa = full_peptide[i]
@@ -172,4 +173,6 @@ class TranscriptDesigner:
             else:
                 committed_codons.append(window_codons[0])
                 
-        return Transcript(best_rbs, peptide, committed_codons)
+        # FIX 3: Return full_peptide here as well
+        return Transcript(best_rbs, full_peptide, committed_codons)
+     # the best approach so far

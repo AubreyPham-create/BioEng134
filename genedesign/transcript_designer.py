@@ -206,6 +206,78 @@ class TranscriptDesigner:
             if changes_made == 0: break
                 
         return current_codons
+    
+    def hard_constraint_optimization(self, utr: str, codons: list[str], amino_acids: str) -> list[str]:
+        """
+        Combined optimizer that removes both forbidden sequences and internal promoters
+        in a single pass. Uses exhaustive synonymous swapping and lookahead safety.
+        """
+        optimized_codons = list(codons)
+        
+        for i in range(len(optimized_codons)):
+            aa = amino_acids[i]
+            candidates = self.aminoAcidToCodons.get(aa, [])
+            if len(candidates) < 2:
+                continue
+                
+            # 1. Global Detection: Check if current state is dirty for either constraint
+            full_seq = utr + "".join(optimized_codons)
+            pass_f, _ = self.forbidden_checker.run(full_seq)
+            pass_p, _ = self.promoter_checker.run(full_seq)
+            
+            # If everything is already clean, skip to next index
+            if pass_f and pass_p:
+                continue
+
+            # 2. Exhaustive Search for a fix
+            original_codon = optimized_codons[i]
+            sorted_candidates = sorted(candidates, key=lambda c: self.codon_weights.get(c, 0), reverse=True)
+            
+            for candidate in sorted_candidates:
+                if candidate == original_codon:
+                    continue
+                
+                # Update test sequence
+                test_codons = list(optimized_codons)
+                test_codons[i] = candidate
+                test_full = utr + "".join(test_codons)
+                
+                # 3. Sliding Window Verification
+                # We use a 150bp window to safely cover both short motifs and long promoter structures
+                pos = len(utr) + (i * 3)
+                check_win = test_full[max(0, pos - 75) : pos + 78]
+                
+                win_f, _ = self.forbidden_checker.run(check_win)
+                win_p, _ = self.promoter_checker.run(check_win)
+                
+                # Only proceed if BOTH are fixed locally
+                if win_f and win_p:
+                    # 4. Lookahead Safety: Ensure we haven't 'locked' the next codon
+                    if i + 1 < len(optimized_codons):
+                        next_aa = amino_acids[i+1]
+                        next_options = self.aminoAcidToCodons.get(next_aa, [])
+                        
+                        can_proceed = False
+                        for n_cand in next_options:
+                            # Verify junction doesn't break both constraints
+                            junction = candidate + n_cand
+                            if self.forbidden_checker.run(junction)[0] and self.promoter_checker.run(junction)[0]:
+                                can_proceed = True
+                                break
+                        
+                        if not can_proceed:
+                            continue # Try next candidate for index i
+                    
+                    # 5. Final check: Does this actually solve the global issue?
+                    # This handles cases where the issue was distant but affected by this index
+                    final_f, _ = self.forbidden_checker.run(test_full)
+                    final_p, _ = self.promoter_checker.run(test_full)
+                    
+                    if final_f and final_p:
+                        optimized_codons[i] = candidate
+                        break 
+                
+        return optimized_codons
 
     def _optimize_window(self, global_history: str, local_context: str, peptide: str, strict=True) -> list[str]:
         best_codons = []
@@ -292,7 +364,8 @@ class TranscriptDesigner:
             window_codons = self._optimize_window(full_context[-150:], full_context[-50:], target_peptide, strict=False)
             committed_codons.append(window_codons[0] if window_codons else self._get_weighted_shuffled_codons(full_peptide[i])[0])
             
-        minized_hairpins = self.minimize_hairpins(utr, committed_codons, full_peptide)
-        final_codons = self._exhaustive_optimize(utr, minized_hairpins, full_peptide)
+        #minized_hairpins = self.minimize_hairpins(utr, committed_codons, full_peptide)
+        optimized_codon = self.hard_constraint_optimization(utr, committed_codons, full_peptide)
+        final_codons = self._exhaustive_optimize(utr, optimized_codon, full_peptide) # this increase valdiation failures
         return Transcript(best_rbs, full_peptide, final_codons)
         # best implementation so far

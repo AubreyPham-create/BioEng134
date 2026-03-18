@@ -1,8 +1,6 @@
 import random
 from genedesign.rbs_chooser import RBSChooser
 from genedesign.models.transcript import Transcript
-
-# Import all unmodified checkers
 from genedesign.checkers.forbidden_sequence_checker import ForbiddenSequenceChecker
 from genedesign.checkers.internal_promoter_checker import PromoterChecker
 from genedesign.checkers.hairpin_checker import hairpin_checker
@@ -12,30 +10,28 @@ from genedesign.checkers.codon_checker import CodonChecker
 class TranscriptDesigner:
     def __init__(self):
         self.aminoAcidToCodons = {}
-        self.codon_weights = {} # For scoring
+        self.codon_weights = {}
         self.rbsChooser = None
         self.forbidden_checker = None
         self.promoter_checker = None
         self.homopolymer_checker = None
         self.codon_checker = None
+        
+        # Scoring Weights
+        self.PENALTY_FORBIDDEN = -1000
+        self.PENALTY_PROMOTER = -500
+        self.PENALTY_HOMOPOLYMER = -200
+        self.PENALTY_CODON_METRICS = -500  # Penalty for failing CodonChecker thresholds
+        self.PENALTY_HAIRPIN = -100
+        self.WEIGHT_CAI = 100  # Multiplier for the 0.0-1.0 codon weight
 
     def initiate(self) -> None:
-        self.rbsChooser = RBSChooser()
-        self.rbsChooser.initiate()
-        
-        self.forbidden_checker = ForbiddenSequenceChecker()
-        self.forbidden_checker.initiate()
-        
-        self.promoter_checker = PromoterChecker()
-        self.promoter_checker.initiate()
-        
-        self.homopolymer_checker = HomopolymerChecker(max_run_length=5)
-        self.homopolymer_checker.initiate()
-        
-        self.codon_checker = CodonChecker()
-        self.codon_checker.initiate()
+        self.rbsChooser = RBSChooser(); self.rbsChooser.initiate()
+        self.forbidden_checker = ForbiddenSequenceChecker(); self.forbidden_checker.initiate()
+        self.promoter_checker = PromoterChecker(); self.promoter_checker.initiate()
+        self.homopolymer_checker = HomopolymerChecker(max_run_length=5); self.homopolymer_checker.initiate()
+        self.codon_checker = CodonChecker(); self.codon_checker.initiate()
 
-        # Codon table with approximate E. coli frequency weights (0.0 to 1.0)
         self.codon_data = {
             'A': [("GCG", 0.36), ("GCC", 0.26), ("GCA", 0.21), ("GCT", 0.17)],
             'C': [("TGC", 0.55), ("TGT", 0.45)],
@@ -64,11 +60,6 @@ class TranscriptDesigner:
             self.aminoAcidToCodons[aa] = [d[0] for d in data]
             for codon, weight in data:
                 self.codon_weights[codon] = weight
-
-    def _get_weighted_shuffled_codons(self, aa: str) -> list[str]:
-        codons = self.aminoAcidToCodons.get(aa, []).copy()
-        codons.sort(key=lambda c: self.codon_weights.get(c, 0) * random.random(), reverse=True)
-        return codons
 
     def _exhaustive_optimize(self, utr: str, codons: list[str], amino_acids: str) -> list[str]:
         """
@@ -140,232 +131,118 @@ class TranscriptDesigner:
             
         return current_codons
     
-    def minimize_hairpins(self, utr: str, codons: list[str], amino_acids: str, passes: int = 3) -> list[str]:
-        """
-        Targetedly removes hairpins by performing multiple sweeps of the sequence.
-        Prioritizes hairpin reduction over codon usage (CAI).
-        """
-        current_codons = list(codons)
-        
-        for p in range(passes):
-            changes_made = 0
-            for i in range(len(current_codons)):
-                # 1. Setup Context with a large 500bp window
-                full_seq_str = utr + "".join(current_codons)
-                pos = len(utr) + (i * 3)
-                win_start = max(0, pos - 250)
-                win_end = pos + 253 
-                
-                current_win_seq = full_seq_str[win_start : win_end]
-                has_hairpin, report = hairpin_checker(current_win_seq)
-                
-                if not has_hairpin:
-                    continue
-                
-                current_h_count = report.count("Hairpin") if isinstance(report, str) else 1
-                
-                # 2. Evaluate Synonymous Alternatives
-                aa = amino_acids[i]
-                candidates = self.aminoAcidToCodons.get(aa, [])
-                if len(candidates) < 2: continue
-                
-                left_side = full_seq_str[win_start : pos]
-                right_side = full_seq_str[pos + 3 : win_end]
-                
-                best_candidate = current_codons[i]
-                min_h_count = current_h_count
-                best_weight = self.codon_weights.get(best_candidate, 0)
-                
-                for candidate in candidates:
-                    if candidate == current_codons[i]: continue
-                    test_win = left_side + candidate + right_side
-                    
-                    # Safety Check: No new forbidden sequences or promoters
-                    motif_win = test_win[max(0, (pos-win_start)-50) : (pos-win_start)+53]
-                    pass_f, _ = self.forbidden_checker.run(motif_win)
-                    pass_p, _ = self.promoter_checker.run(motif_win)
-                    
-                    if pass_f and pass_p:
-                        _, test_report = hairpin_checker(test_win)
-                        test_h_count = test_report.count("Hairpin") if isinstance(test_report, str) else 0
-                        test_weight = self.codon_weights.get(candidate, 0)
-                        
-                        # PRIORITY: Lower Hairpin Count > Higher CAI
-                        if test_h_count < min_h_count:
-                            min_h_count = test_h_count
-                            best_candidate = candidate
-                            best_weight = test_weight
-                        elif test_h_count == min_h_count and test_weight > best_weight:
-                            best_candidate = candidate
-                            best_weight = test_weight
-                
-                if best_candidate != current_codons[i]:
-                    current_codons[i] = best_candidate
-                    changes_made += 1
-            
-            if changes_made == 0: break
-                
-        return current_codons
-    
-    def hard_constraint_optimization(self, utr: str, codons: list[str], amino_acids: str) -> list[str]:
-        """
-        Combined optimizer that removes both forbidden sequences and internal promoters
-        in a single pass. Uses exhaustive synonymous swapping and lookahead safety.
-        """
-        optimized_codons = list(codons)
-        
-        for i in range(len(optimized_codons)):
-            aa = amino_acids[i]
-            candidates = self.aminoAcidToCodons.get(aa, [])
-            if len(candidates) < 2:
-                continue
-                
-            # 1. Global Detection: Check if current state is dirty for either constraint
-            full_seq = utr + "".join(optimized_codons)
-            pass_f, _ = self.forbidden_checker.run(full_seq)
-            pass_p, _ = self.promoter_checker.run(full_seq)
-            
-            # If everything is already clean, skip to next index
-            if pass_f and pass_p:
-                continue
+    def hairpin_counter(self, dna, min_stem=3, min_loop=4, max_loop=9):
+        """ Counts the total number of distinct hairpin structures in a DNA sequence. """
+        def get_reverse_complement(seq):
+            complement = {'A': 'T', 'C': 'G', 'G': 'C', 'T': 'A', 'N': 'N'}
+            return "".join(complement.get(base, base) for base in reversed(seq))
 
-            # 2. Exhaustive Search for a fix
-            original_codon = optimized_codons[i]
-            sorted_candidates = sorted(candidates, key=lambda c: self.codon_weights.get(c, 0), reverse=True)
-            
-            for candidate in sorted_candidates:
-                if candidate == original_codon:
-                    continue
-                
-                # Update test sequence
-                test_codons = list(optimized_codons)
-                test_codons[i] = candidate
-                test_full = utr + "".join(test_codons)
-                
-                # 3. Sliding Window Verification
-                # We use a 150bp window to safely cover both short motifs and long promoter structures
-                pos = len(utr) + (i * 3)
-                check_win = test_full[max(0, pos - 75) : pos + 78]
-                
-                win_f, _ = self.forbidden_checker.run(check_win)
-                win_p, _ = self.promoter_checker.run(check_win)
-                
-                # Only proceed if BOTH are fixed locally
-                if win_f and win_p:
-                    # 4. Lookahead Safety: Ensure we haven't 'locked' the next codon
-                    if i + 1 < len(optimized_codons):
-                        next_aa = amino_acids[i+1]
-                        next_options = self.aminoAcidToCodons.get(next_aa, [])
-                        
-                        can_proceed = False
-                        for n_cand in next_options:
-                            # Verify junction doesn't break both constraints
-                            junction = candidate + n_cand
-                            if self.forbidden_checker.run(junction)[0] and self.promoter_checker.run(junction)[0]:
-                                can_proceed = True
-                                break
-                        
-                        if not can_proceed:
-                            continue # Try next candidate for index i
-                    
-                    # 5. Final check: Does this actually solve the global issue?
-                    # This handles cases where the issue was distant but affected by this index
-                    final_f, _ = self.forbidden_checker.run(test_full)
-                    final_p, _ = self.promoter_checker.run(test_full)
-                    
-                    if final_f and final_p:
-                        optimized_codons[i] = candidate
+        hairpin_count = 0
+        first_hairpin_found = None
+        n = len(dna)
+        for i in range(n):
+            for stem_len in range(min_stem, (n - max_loop) // 2 + 1):
+                stem_a = dna[i : i + stem_len]
+                if len(stem_a) < min_stem: break
+                for loop_len in range(min_loop, max_loop + 1):
+                    start_b = i + stem_len + loop_len
+                    end_b = start_b + stem_len
+                    if end_b > n: break
+                    stem_b = dna[start_b : end_b]
+                    if stem_a == get_reverse_complement(stem_b):
+                        hairpin_count += 1
+                        if not first_hairpin_found: first_hairpin_found = dna[i : end_b]
                         break 
-                
-        return optimized_codons
+        return hairpin_count, first_hairpin_found
 
-    def _optimize_window(self, global_history: str, local_context: str, peptide: str, strict=True) -> list[str]:
-        best_codons = []
-        eval_counter = [0]
-        max_evals = 50
+    def _score_candidate(self, sequence_window: str, variant_codons: list, committed_codons: list) -> tuple[float, bool]:
+        score = 0.0
+        all_passed = True
+        
+        # 1. FASTEST: Internal Promoters
+        
+        passed_prom, _ = self.promoter_checker.run(sequence_window)
+        if not passed_prom:
+            score += self.PENALTY_PROMOTER
+            all_passed = False
+        
+        # 2. Fast: Forbidden Sequences
+        pass_forb, _ = self.forbidden_checker.run(sequence_window)
+        if not pass_forb:
+            score += self.PENALTY_FORBIDDEN
+            all_passed = False
 
-        def dfs(depth, current_local_context, current_codons):
-            if eval_counter[0] > max_evals: return False
-            if depth == len(peptide):
-                eval_counter[0] += 1
-                proposed_seq = "".join(current_codons)
-                test_seq = global_history + proposed_seq
-                
-                if strict:
-                    passed_hairpin, _ = hairpin_checker(test_seq)
-                    if not passed_hairpin: return False
-                    passed_promoter, _ = self.promoter_checker.run(test_seq)
-                    if not passed_promoter: return False
-                
-                best_codons.extend(current_codons)
-                return True
+        """
+        # 2. HEAVY: Hairpins (Only check if promoters passed to save time)
+        if all_passed:
+            h_count, _ = self.hairpin_counter(sequence_window)
+            if h_count > 0:
+                score += (h_count * self.PENALTY_HAIRPIN)
+                all_passed = False 
+        
+        """
+        # 3. GLOBAL: Codon Metrics (Diversity, Rare Codons, Global CAI)
+        full_potential_list = committed_codons + variant_codons
+        codons_above_board, _, _, _ = self.codon_checker.run(full_potential_list)
+        
+        # Update all_passed based on codon metrics
+        # We only enforce this after 40 codons so diversity has a chance to build up
+        if len(full_potential_list) > 40 and not codons_above_board:
+            score += self.PENALTY_CODON_METRICS
+            all_passed = False # CRITICAL: Prevents Early Exit if diversity is too low
 
-            amino_acid = peptide[depth]
-            available_codons = self._get_weighted_shuffled_codons(amino_acid)
-            
-            for codon in available_codons:
-                if eval_counter[0] > max_evals: break
-                test_local_context = current_local_context + codon
-                passed_forbidden, _ = self.forbidden_checker.run(test_local_context)
-                passed_homopolymer, _ = self.homopolymer_checker.run(test_local_context)
-                
-                if passed_forbidden and passed_homopolymer:
-                    if dfs(depth + 1, test_local_context, current_codons + [codon]):
-                        return True
-            return False
+        # 4. SCORING: CAI and Diversity Bonus (Always calculated for ranking)
+        avg_cai = sum(self.codon_weights.get(c, 0) for c in variant_codons) / len(variant_codons)
+        score += avg_cai * self.WEIGHT_CAI
 
-        dfs(0, local_context, [])
-        return best_codons
+        history_set = set(committed_codons)
+        new_codons = [c for c in variant_codons if c not in history_set]
+        score += len(set(new_codons)) * 50 
+        
+        return score, all_passed
+        
 
     def run(self, peptide: str, ignores: set) -> Transcript:
-        if not peptide.startswith('M'):
-            peptide = 'M' + peptide
         full_peptide = peptide if peptide.endswith('*') else peptide + '*'
         
-        max_attempts = 15
-        local_ignores = set(ignores)
-        attempt_history = {}
-
-        for attempt in range(max_attempts):
-            try:
-                selectedRBS = self.rbsChooser.run("", local_ignores)
-                utr = selectedRBS.utr.upper()
-                committed_codons = []
-                
-                for i in range(len(full_peptide)):
-                    target_peptide = full_peptide[i : i + 3]
-                    full_context = utr + ''.join(committed_codons)
-                    window_codons = self._optimize_window(full_context[-150:], full_context[-50:], target_peptide, strict=True)
-                    if not window_codons:
-                        raise ValueError("Trap")
-                    committed_codons.append(window_codons[0])
-                
-                # Perform Exhaustive Ranking Optimization
-                final_codons = self._exhaustive_optimize(utr, committed_codons, full_peptide)
-                
-                codons_above_board, codon_div, _, cai_val = self.codon_checker.run(final_codons)
-                if not codons_above_board:
-                    raise ValueError(f"Codon metrics failed: CAI={cai_val:.2f}, Div={codon_div:.2f}")
-                
-                return Transcript(selectedRBS, full_peptide, final_codons)
-
-            except ValueError:
-                attempt_history[selectedRBS] = len(committed_codons)
-                local_ignores.add(selectedRBS)
-            except Exception:
-                break
-
-        # Emergency Fallback
-        best_rbs = max(attempt_history, key=attempt_history.get) if attempt_history else self.rbsChooser.run("", ignores)
-        utr, committed_codons = best_rbs.utr.upper(), []
-        for i in range(len(full_peptide)):
-            target_peptide = full_peptide[i : i + 1]
-            full_context = utr + ''.join(committed_codons)
-            window_codons = self._optimize_window(full_context[-150:], full_context[-50:], target_peptide, strict=False)
-            committed_codons.append(window_codons[0] if window_codons else self._get_weighted_shuffled_codons(full_peptide[i])[0])
+        # Choose RBS
+        selectedRBS = self.rbsChooser.run("", ignores)
+        utr = selectedRBS.utr.upper()
+        
+        committed_codons = []
+        window_size = 3 # Number of amino acids to look ahead
+        
+        idx = 0
+        while idx < len(full_peptide):
+            window_pep = full_peptide[idx : idx + window_size]
+            best_candidate = None
             
-        #minized_hairpins = self.minimize_hairpins(utr, committed_codons, full_peptide)
-        optimized_codon = self.hard_constraint_optimization(utr, committed_codons, full_peptide)
-        final_codons = self._exhaustive_optimize(utr, optimized_codon, full_peptide) # this increase valdiation failures
-        return Transcript(best_rbs, full_peptide, final_codons)
-        # best implementation so far
+            for _ in range(10): # tries 10 sequences, uses only the best
+                variant = []
+                for aa in window_pep:
+                    choices = self.aminoAcidToCodons[aa]
+                    variant.append(random.choices(choices, weights=[self.codon_weights[c] for c in choices])[0])
+                
+                context = (utr + "".join(committed_codons))[-50:]
+                test_seq = context + "".join(variant)
+                
+                # Modified scorer returns (score, all_passed_boolean)
+                score, all_passed = self._score_candidate(test_seq, variant, committed_codons)
+                
+                current_candidate = (variant, score)
+                
+                # Keep track of the 'best' so far in case none pass perfectly
+                if best_candidate is None or score > best_candidate[1]:
+                    best_candidate = current_candidate
+                
+                # FIRST-FIT LOGIC: Exit early if this candidate is perfect
+                if all_passed:
+                    best_candidate = current_candidate
+                    break 
+            
+            committed_codons.append(best_candidate[0][0])
+            idx += 1
+
+        #final_codons = self._exhaustive_optimize(utr, committed_codons, full_peptide) 
+
+        return Transcript(selectedRBS, full_peptide, committed_codons)

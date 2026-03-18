@@ -82,7 +82,7 @@ class TranscriptDesigner:
             current_variant = [optimized_codons[i]]
             test_seq = context_str + "".join(current_variant)
             
-            current_best_score, _, _ = self._score_candidate(test_seq, current_variant, committed_before)
+            current_best_score, _, _ = self._score_candidate(test_seq, current_variant, committed_before, utr)
             best_codon_for_pos = optimized_codons[i]
             
             for alternative in synonymous_choices:
@@ -94,7 +94,7 @@ class TranscriptDesigner:
                 test_seq = context_str + "".join(test_variant)
                 
                 # Pass the joined string as the first argument
-                test_score, _, _ = self._score_candidate(test_seq, test_variant, committed_before)
+                test_score, _, _ = self._score_candidate(test_seq, test_variant, committed_before, utr)
                 
                 if test_score > current_best_score:
                     current_best_score = test_score
@@ -106,46 +106,50 @@ class TranscriptDesigner:
     
     def _break_hairpin(self, utr: str, committed_codons: list[str], variant_codons: list[str], bad_seq: str, window_pep: str) -> tuple[list[str], float, bool]:
         """
-        Attempts to break a detected hairpin by synonymous codon swapping.
-        Returns the best variant found, its score, and its passed status.
+        Targeted Mutation: Identifies the specific codons overlapping the hairpin 
+        and swaps them for the best synonymous alternative that breaks the stem.
         """
         best_variant = list(variant_codons)
         context_str = (utr + "".join(committed_codons))[-50:]
         
-        # Initial scoring of the 'bad' sequence to have a baseline
+        # Get baseline
         current_test_seq = context_str + "".join(variant_codons)
-        best_score, best_passed, _ = self._score_candidate(current_test_seq, variant_codons, committed_codons)
+        best_score, best_passed, _ = self._score_candidate(current_test_seq, variant_codons, committed_codons, utr)
 
-        # Iterate through the codons in the variant to find a target for mutation
+        # Identify which codons in the variant overlap with the bad_seq
+        # We check each codon's position in the joined variant string
+        variant_dna = "".join(variant_codons)
+        
         for i in range(len(variant_codons)):
-            codon = variant_codons[i]
+            codon_start = i * 3
+            codon_seq = variant_codons[i]
             
-            # If this codon's sequence is part of the hairpin stem
-            if codon in bad_seq:
+            # If any part of this codon is inside the bad_seq
+            # We use a simple string check, but could be more precise with indices
+            if codon_seq in bad_seq:
                 aa = window_pep[i]
                 choices = self.aminoAcidToCodons[aa]
                 
                 if len(choices) > 1:
+                    # Test every alternative synonymous codon for this specific position
                     for alt_codon in choices:
-                        if alt_codon == codon:
+                        if alt_codon == variant_codons[i]:
                             continue
                         
-                        # Create a test variant with the swap
                         test_variant = list(variant_codons)
                         test_variant[i] = alt_codon
                         
-                        # Build and score the new sequence
                         test_seq = context_str + "".join(test_variant)
-                        test_score, test_passed, _ = self._score_candidate(test_seq, test_variant, committed_codons)
+                        test_score, test_passed, _ = self._score_candidate(test_seq, test_variant, committed_codons, utr)
                         
-                        # If the swap improves the score (e.g., removes hairpin without adding a promoter)
-                        # we adopt it as the new best
+                        # Optimization: If this alternative breaks the hairpin AND 
+                        # maintains a better score than our current best, keep it.
                         if test_score > best_score:
                             best_score = test_score
                             best_variant = test_variant
                             best_passed = test_passed
                             
-                            # If we found a version that passes everything, we can stop early
+                            # If we fixed the hairpin and passed all other checks, stop
                             if best_passed:
                                 return best_variant, best_score, True
 
@@ -175,9 +179,10 @@ class TranscriptDesigner:
                         break 
         return hairpin_count, first_hairpin_found
 
-    def _score_candidate(self, sequence_window: str, variant_codons: list, committed_codons: list) -> tuple[float, bool]:
+    def _score_candidate(self, sequence_window: str, variant_codons: list, committed_codons: list, utr) -> tuple[float, bool]:
         score = 0.0
         all_passed = True
+        bad_seq = None
         
         # 1. FASTEST: Internal Promoters        
         passed_prom, _ = self.promoter_checker.run(sequence_window)
@@ -194,11 +199,12 @@ class TranscriptDesigner:
         
         """
         # 2. HEAVY: Hairpins (Only check if promoters passed to save time)
-        hairpin_str = None
+        full_dna = utr + "".join(committed_codons) + "".join(variant_codons)
         if all_passed:
-            passed_hairpin, hairpin_str = hairpin_checker(sequence_window) # Use the imported checker
+            passed_hairpin, bad_seq = hairpin_checker(full_dna) # Use the imported checker
             if not passed_hairpin:
                 score += self.PENALTY_HAIRPIN
+                all_passed = False
         """
         
         # 3. GLOBAL: Codon Metrics (Diversity, Rare Codons, Global CAI)
@@ -219,7 +225,7 @@ class TranscriptDesigner:
         new_codons = [c for c in variant_codons if c not in history_set]
         score += len(set(new_codons)) * 50 
         
-        return score, all_passed, None # change the None back to hairpin_str
+        return score, all_passed, bad_seq
         
 
     def run(self, peptide: str, ignores: set) -> Transcript:
@@ -240,7 +246,7 @@ class TranscriptDesigner:
             best_candidate = None
             context = (utr + "".join(committed_codons))[-50:]
             
-            for _ in range(100): # tries 10 sequences, uses only the best
+            for _ in range(10): # tries 10 sequences, uses only the best
                 variant = []
                 for aa in window_pep:
                     choices = self.aminoAcidToCodons[aa]
@@ -248,7 +254,7 @@ class TranscriptDesigner:
                 test_seq = context + "".join(variant)
                 
                 # Modified scorer returns (score, all_passed_boolean)
-                score, all_passed, bad_seq = self._score_candidate(test_seq, variant, committed_codons)
+                score, all_passed, bad_seq = self._score_candidate(test_seq, variant, committed_codons, utr)
                 
                 # tries replacing a codon to break a hairpin
                 if not all_passed and bad_seq:

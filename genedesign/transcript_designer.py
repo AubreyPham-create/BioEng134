@@ -19,7 +19,7 @@ class TranscriptDesigner:
         
         # Scoring Weights
         self.PENALTY_FORBIDDEN = -1000
-        self.PENALTY_PROMOTER = -500
+        self.PENALTY_PROMOTER = -750
         self.PENALTY_HOMOPOLYMER = -200
         self.PENALTY_CODON_METRICS = -500  # Penalty for failing CodonChecker thresholds
         self.PENALTY_HAIRPIN = -100
@@ -62,75 +62,95 @@ class TranscriptDesigner:
                 self.codon_weights[codon] = weight
 
     def _exhaustive_optimize(self, utr: str, codons: list[str], amino_acids: str) -> list[str]:
-        """
-        Refines the sequence by aggressively minimizing hairpins and removing hard motifs.
-        Uses local windowing to avoid expensive string operations.
-        """
-        current_codons = list(codons)
+        optimized_codons = list(codons)
         
-        for i in range(len(current_codons)):
+        for i in range(len(optimized_codons)):
             aa = amino_acids[i]
-            candidates = self.aminoAcidToCodons.get(aa, [])
-            if len(candidates) < 2:
+            synonymous_choices = self.aminoAcidToCodons[aa]
+            
+            if len(synonymous_choices) <= 1:
                 continue
                 
-            # Pre-calculate the full string once per position to extract context
-            full_seq_str = utr + "".join(current_codons)
-            pos = len(utr) + (i * 3)
+            # 1. Prepare context: Previous codons + current + future
+            # History is everything before index i
+            committed_before = optimized_codons[:i]
+            # Context string for the checkers (50bp history)
+            context_str = (utr + "".join(committed_before))[-50:]
             
-            # Extract +/- 100bp context to handle the maximum checker window
-            left_context = full_seq_str[max(0, pos - 100) : pos]
-            right_context = full_seq_str[pos + 3 : pos + 103]
+            # 2. Score current codon at this position
+            # We must join the variant list into a string for the first argument!
+            current_variant = [optimized_codons[i]]
+            test_seq = context_str + "".join(current_variant)
             
-            scored_candidates = []
-            for candidate in candidates:
-                # Construct local strings for testing
-                motif_win = left_context[-60:] + candidate + right_context[:60]
-                hair_win = left_context[-100:] + candidate + right_context[:100]
+            current_best_score, _, _ = self._score_candidate(test_seq, current_variant, committed_before)
+            best_codon_for_pos = optimized_codons[i]
+            
+            for alternative in synonymous_choices:
+                if alternative == optimized_codons[i]:
+                    continue
                 
-                # 1. Check Hard Constraints (Forbidden/Promoters)
-                passed_forb, _ = self.forbidden_checker.run(motif_win)
-                passed_prom, _ = self.promoter_checker.run(motif_win)
-                passed_homo, _ = self.homopolymer_checker.run(motif_win)
+                test_variant = [alternative]
+                # JOIN into a string to avoid the 'list' object has no attribute 'upper' error
+                test_seq = context_str + "".join(test_variant)
                 
-                # 2. Count Hairpins (The Primary Optimization Goal)
-                _, hair_report = hairpin_checker(hair_win)
-                h_count = hair_report.count("Hairpin") if isinstance(hair_report, str) else 0
+                # Pass the joined string as the first argument
+                test_score, _, _ = self._score_candidate(test_seq, test_variant, committed_before)
                 
-                # 3. Check Global Metrics (Diversity/Rare Codons)
-                # We update the list temporarily to check global diversity
-                original_at_i = current_codons[i]
-                current_codons[i] = candidate
-                passed_metrics, _, _, _ = self.codon_checker.run(current_codons)
-                current_codons[i] = original_at_i
-
-                # Assign Tier: 
-                # Tier 0: Safe (No Promoters/Forbidden) AND Clean (No Hairpins)
-                # Tier 1: Safe (No Promoters/Forbidden) BUT has Hairpins
-                # Tier 2: Unsafe (Contains Promoter or Forbidden sequence)
-                if passed_forb and passed_prom and passed_homo:
-                    tier = 0 if h_count == 0 else 1
-                else:
-                    tier = 2
-                
-                scored_candidates.append({
-                    'codon': candidate,
-                    'tier': tier,
-                    'h_count': h_count,
-                    'weight': self.codon_weights.get(candidate, 0)
-                })
+                if test_score > current_best_score:
+                    current_best_score = test_score
+                    best_codon_for_pos = alternative
             
-            # SORTING LOGIC:
-            # 1. Tier (Safety First)
-            # 2. h_count (Lowest number of hairpins in window)
-            # 3. weight (Best CAI as the final tie-breaker)
-            scored_candidates.sort(key=lambda x: (x['tier'], x['h_count'], -x['weight']))
+            optimized_codons[i] = best_codon_for_pos
             
-            # Update the codon at this position with the winner
-            current_codons[i] = scored_candidates[0]['codon']
-            
-        return current_codons
+        return optimized_codons
     
+    def _break_hairpin(self, utr: str, committed_codons: list[str], variant_codons: list[str], bad_seq: str, window_pep: str) -> tuple[list[str], float, bool]:
+        """
+        Attempts to break a detected hairpin by synonymous codon swapping.
+        Returns the best variant found, its score, and its passed status.
+        """
+        best_variant = list(variant_codons)
+        context_str = (utr + "".join(committed_codons))[-50:]
+        
+        # Initial scoring of the 'bad' sequence to have a baseline
+        current_test_seq = context_str + "".join(variant_codons)
+        best_score, best_passed, _ = self._score_candidate(current_test_seq, variant_codons, committed_codons)
+
+        # Iterate through the codons in the variant to find a target for mutation
+        for i in range(len(variant_codons)):
+            codon = variant_codons[i]
+            
+            # If this codon's sequence is part of the hairpin stem
+            if codon in bad_seq:
+                aa = window_pep[i]
+                choices = self.aminoAcidToCodons[aa]
+                
+                if len(choices) > 1:
+                    for alt_codon in choices:
+                        if alt_codon == codon:
+                            continue
+                        
+                        # Create a test variant with the swap
+                        test_variant = list(variant_codons)
+                        test_variant[i] = alt_codon
+                        
+                        # Build and score the new sequence
+                        test_seq = context_str + "".join(test_variant)
+                        test_score, test_passed, _ = self._score_candidate(test_seq, test_variant, committed_codons)
+                        
+                        # If the swap improves the score (e.g., removes hairpin without adding a promoter)
+                        # we adopt it as the new best
+                        if test_score > best_score:
+                            best_score = test_score
+                            best_variant = test_variant
+                            best_passed = test_passed
+                            
+                            # If we found a version that passes everything, we can stop early
+                            if best_passed:
+                                return best_variant, best_score, True
+
+        return best_variant, best_score, best_passed
+        
     def hairpin_counter(self, dna, min_stem=3, min_loop=4, max_loop=9):
         """ Counts the total number of distinct hairpin structures in a DNA sequence. """
         def get_reverse_complement(seq):
@@ -159,8 +179,7 @@ class TranscriptDesigner:
         score = 0.0
         all_passed = True
         
-        # 1. FASTEST: Internal Promoters
-        
+        # 1. FASTEST: Internal Promoters        
         passed_prom, _ = self.promoter_checker.run(sequence_window)
         if not passed_prom:
             score += self.PENALTY_PROMOTER
@@ -172,15 +191,16 @@ class TranscriptDesigner:
             score += self.PENALTY_FORBIDDEN
             all_passed = False
 
-        """
-        # 2. HEAVY: Hairpins (Only check if promoters passed to save time)
-        if all_passed:
-            h_count, _ = self.hairpin_counter(sequence_window)
-            if h_count > 0:
-                score += (h_count * self.PENALTY_HAIRPIN)
-                all_passed = False 
         
         """
+        # 2. HEAVY: Hairpins (Only check if promoters passed to save time)
+        hairpin_str = None
+        if all_passed:
+            passed_hairpin, hairpin_str = hairpin_checker(sequence_window) # Use the imported checker
+            if not passed_hairpin:
+                score += self.PENALTY_HAIRPIN
+        """
+        
         # 3. GLOBAL: Codon Metrics (Diversity, Rare Codons, Global CAI)
         full_potential_list = committed_codons + variant_codons
         codons_above_board, _, _, _ = self.codon_checker.run(full_potential_list)
@@ -199,7 +219,7 @@ class TranscriptDesigner:
         new_codons = [c for c in variant_codons if c not in history_set]
         score += len(set(new_codons)) * 50 
         
-        return score, all_passed
+        return score, all_passed, None # change the None back to hairpin_str
         
 
     def run(self, peptide: str, ignores: set) -> Transcript:
@@ -210,28 +230,32 @@ class TranscriptDesigner:
         utr = selectedRBS.utr.upper()
         
         committed_codons = []
-        window_size = 3 # Number of amino acids to look ahead
+        window_size = 9 # Number of amino acids to look ahead
         
         idx = 0
         while idx < len(full_peptide):
+            remaining_len = len(full_peptide) - idx
+            num_to_commit = min(3, remaining_len)
             window_pep = full_peptide[idx : idx + window_size]
             best_candidate = None
+            context = (utr + "".join(committed_codons))[-50:]
             
-            for _ in range(10): # tries 10 sequences, uses only the best
+            for _ in range(100): # tries 10 sequences, uses only the best
                 variant = []
                 for aa in window_pep:
                     choices = self.aminoAcidToCodons[aa]
                     variant.append(random.choices(choices, weights=[self.codon_weights[c] for c in choices])[0])
-                
-                context = (utr + "".join(committed_codons))[-50:]
                 test_seq = context + "".join(variant)
                 
                 # Modified scorer returns (score, all_passed_boolean)
-                score, all_passed = self._score_candidate(test_seq, variant, committed_codons)
+                score, all_passed, bad_seq = self._score_candidate(test_seq, variant, committed_codons)
                 
+                # tries replacing a codon to break a hairpin
+                if not all_passed and bad_seq:
+                    variant, score, all_passed = self._break_hairpin(utr, committed_codons, variant, bad_seq, window_pep)
+
+                # Update the best candidate for this position
                 current_candidate = (variant, score)
-                
-                # Keep track of the 'best' so far in case none pass perfectly
                 if best_candidate is None or score > best_candidate[1]:
                     best_candidate = current_candidate
                 
@@ -240,9 +264,9 @@ class TranscriptDesigner:
                     best_candidate = current_candidate
                     break 
             
-            committed_codons.append(best_candidate[0][0])
-            idx += 1
+            for i in range(num_to_commit):
+                committed_codons.append(best_candidate[0][i])
+            idx += num_to_commit
 
         #final_codons = self._exhaustive_optimize(utr, committed_codons, full_peptide) 
-
         return Transcript(selectedRBS, full_peptide, committed_codons)

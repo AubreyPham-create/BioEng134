@@ -61,6 +61,15 @@ class TranscriptDesigner:
             for codon, weight in data:
                 self.codon_weights[codon] = weight
     
+    def get_codons(dna_sequence: str) -> list:
+        dna = dna_sequence.upper()
+        codons = [dna[i : i + 3] for i in range(0, len(dna), 3)]
+        if len(codons) > 0 and len(codons[-1]) < 3:
+            print(f"Warning: The last fragment '{codons[-1]}' is not a full codon.")
+            
+        return codons
+
+    
     def _score_candidate(self, sequence_window: str, variant_codons: list, committed_codons: list) -> tuple[bool, str]:
         """
         Acts as a guard clause. Returns True only if all sequence constraints are met.
@@ -72,19 +81,19 @@ class TranscriptDesigner:
             return False
 
         # 2. Guard: Forbidden Sequences
-        #passed_forb, _ = self.forbidden_checker.run(sequence_window)
-        #if not passed_forb:
-            #return False
+        passed_forb, _ = self.forbidden_checker.run(sequence_window)
+        if not passed_forb:
+            return False
         
         # 3. Guard: Homopolymers
-        #passed_homo, _ = self.homopolymer_checker.run(sequence_window)
-        #if not passed_homo:
-            #return False
+        passed_homo, _ = self.homopolymer_checker.run(sequence_window)
+        if not passed_homo:
+            return False
         
         # 4. Guard: Hairpins (Checked against the full DNA for global safety)
-        #passed_hairpin, _ = hairpin_checker(sequence_window)
-        #if not passed_hairpin:
-            #return False
+        passed_hairpin, _ = hairpin_checker(sequence_window)
+        if not passed_hairpin:
+            return False
         
         return True
     
@@ -99,7 +108,7 @@ class TranscriptDesigner:
             codon_list.append(selected_codon)
         return codon_list
 
-    def run(self, peptide: str, ignores: set) -> Transcript:
+    def _design_transcript(self, peptide: str, ignores: set) -> Transcript:
         full_peptide = peptide if peptide.endswith('*') else peptide + '*'
         selectedRBS = self.rbsChooser.run("", ignores)
         utr = selectedRBS.utr.upper()
@@ -114,7 +123,7 @@ class TranscriptDesigner:
             context = (utr + "".join(committed_codons))[-6:]
             best_legal_variant = None
             
-            while (True):
+            for i in range(1_000_001):
                 variant = self.select_random_codon(window_pep)
                 
                 test_seq = context + "".join(variant)
@@ -126,12 +135,44 @@ class TranscriptDesigner:
                 if success:
                     best_legal_variant = variant
                     break
+                if i == 1_000_000:
+                    print("Attempt failed: restarting...")
+                    return self.run(peptide)
             
             committed_codons.append(best_legal_variant[0])
             idx += 1
+            
 
         return Transcript(selectedRBS, full_peptide, committed_codons)
     
+    def run(self, peptide, ignores=set(), max_retries=10):
+        """
+        Supervisor function: Calls the design logic and validates the 
+        final product against the global checkers.
+        """
+        for attempt in range(max_retries):
+            # 1. Generate a candidate using the original logic
+            # (Renamed from run to _design_transcript)
+            transcript = self._design_transcript(peptide, ignores)
+            
+            # 2. Combine RBS and Codons for a full sequence audit
+            # The benchmark fails often at this junction!
+            full_dna = (transcript.rbs.utr + "".join(transcript.codons)).upper()
+            
+            # 3. Explicitly unpack the tuples (Boolean, Message)
+            # Using [0] ensures we get the True/False value, not the 'Truthy' tuple
+            forbidden_pass = self.forbidden_checker.run(full_dna)[0]
+            promoter_pass = self.promoter_checker.run(full_dna)[0]
+            hairpin_pass = hairpin_checker(full_dna)[0]
+            
+            if forbidden_pass and promoter_pass and hairpin_pass:
+                return transcript
+
+            print(f"Attempt {attempt + 1} failed global checks. Retrying...")
+
+        return transcript
+        raise Exception(f"Could not produce a valid transcript for {peptide[:10]}... after {max_retries} retries.")
+        
 
 
 if __name__ == "__main__":

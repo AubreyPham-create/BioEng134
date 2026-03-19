@@ -150,7 +150,8 @@ class TranscriptDesigner:
         Supervisor function: Calls the design logic and validates the 
         final product against the global checkers.
         """
-        for attempt in range(max_retries):
+        attempt = 0
+        while (True):
             # 1. Generate a candidate using the original logic
             # (Renamed from run to _design_transcript)
             transcript = self._design_transcript(peptide, ignores)
@@ -169,8 +170,8 @@ class TranscriptDesigner:
                 return transcript
 
             print(f"Attempt {attempt + 1} failed global checks. Retrying...")
+            attempt += 1
 
-        return transcript
         raise Exception(f"Could not produce a valid transcript for {peptide[:10]}... after {max_retries} retries.")
         
 
